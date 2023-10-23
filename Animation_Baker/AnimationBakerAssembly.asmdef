@@ -1,0 +1,16 @@
+{
+    "name": "AnimationBakerAssembly",
+    "rootNamespace": "",
+    "references": [
+        "GUID:ecb666e1f186c384e9f185b5d761a48f"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

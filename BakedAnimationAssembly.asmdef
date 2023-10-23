@@ -1,0 +1,19 @@
+{
+    "name": "BakedAnimationAssembly",
+    "rootNamespace": "",
+    "references": [
+        "GUID:b69fb65d2008aea4a92eb9e59e206d6d",
+        "GUID:ecb666e1f186c384e9f185b5d761a48f",
+        "GUID:e0cd26848372d4e5c891c569017e11f1",
+        "GUID:d8b63aba1907145bea998dd612889d6b"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

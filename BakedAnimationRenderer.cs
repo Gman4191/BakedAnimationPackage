@@ -1,0 +1,273 @@
+using System;
+using UnityEngine;
+using Unity.Collections;
+using Unity.Jobs;
+using UnityEngine.Jobs;
+
+
+public class BakedAnimationRenderer
+{
+    private const int OBJECT_BUFFER_SIZE = sizeof(float) * 13 + sizeof(uint) * 2;
+    private const int THREAD_GROUP_SIZE  = 32;
+    private const int LOD_BUFFER_SIZE    = 512;
+
+    // Number of animated objects
+    private int numberOfInstances;
+
+    // Arguments for instanced indirect rendering
+    private ComputeBuffer argsBuffer;
+
+    // Object information
+    private NativeArray<objectInfo> objectInformationArray;
+    private ComputeBuffer           objectInformationBuffer;
+
+    // Transform Access to be used in transform assignment
+    private TransformAccessArray transformAccessArray;
+
+    // Material with the "PlayShaderInstanced" shader
+    private Material instanceMaterial;
+
+    // The mesh that will be animated and rendered
+    private Mesh mesh;
+
+    // The index of the mesh used in the mesh data
+    private int subMeshIndex = 0;
+
+    // Generated stacked Vertex Animation Textures
+    private Texture2D stackedPositionTexture;
+    private Texture2D stackedNormalTexture;
+
+    // Length in seconds of the animations
+    private NativeArray<float> animationLengthsInSecs;
+
+    // Starting offset into stacked textures on the Y dimension for each animation 
+    private NativeArray<float> animationStartOffsets;
+
+    // Length of the animations within texture space scaled within the stacked textures
+    private NativeArray<float> animationEndOffsets;
+    
+    // Starting times in seconds of the current animations being played by instanced objects
+    private NativeArray<float> currentAnimationStartTimes;
+
+    // Contains the indices of objects that should use their base LOD (LOD buffers)
+    private NativeList<int> renderedIndices;
+    private NativeList<int> previousRenderedIndices;
+    
+
+    // Initialize mesh and object instance data
+    public void Initialize(int numberOfInstances, Mesh instanceMesh, Material animationMaterial,
+                           Transform[] transforms, AnimationObject[] animationObjects, int _subMeshIndex = 0)
+    {
+        if (instanceMesh == null)
+        {
+            throw new ArgumentNullException("instanceMesh", "InstanceMesh cannot be null.");
+        }
+
+        this.numberOfInstances = numberOfInstances;
+
+        // Initialize the arguments buffer with mesh data and the number of instances to render
+        uint[] args = new uint[5] {instanceMesh.GetIndexCount(_subMeshIndex),
+                                   (uint)numberOfInstances,
+                                   instanceMesh.GetIndexStart(_subMeshIndex),
+                                   instanceMesh.GetBaseVertex(_subMeshIndex), 0};
+
+        argsBuffer = new ComputeBuffer(1, args.Length * sizeof(uint), ComputeBufferType.IndirectArguments);
+        argsBuffer.SetData(args);
+
+        instanceMaterial = animationMaterial;
+        subMeshIndex     = _subMeshIndex;
+        mesh             = instanceMesh;
+
+        GenerateAndSetStackedTextures(animationObjects);
+        InitializeAnimationMetaData  (animationObjects);
+        InitializeObjectInformation  ();
+
+        // Initialize the rendered object index queue
+        renderedIndices = new NativeList<int>(LOD_BUFFER_SIZE, Allocator.Persistent);
+        previousRenderedIndices = new NativeList<int>(LOD_BUFFER_SIZE, Allocator.Persistent);
+
+        // Initialize the thread safe transform access array
+        transformAccessArray = new TransformAccessArray(transforms);
+    }
+
+    // Call every frame, updates the object information of the instanced meshes
+    public void RenderAnimatedMeshInstanced(Bounds bounds)
+    {
+        if(mesh == null)
+            return;
+        
+        UpdateBuffers();
+        
+        HandleAnimations();
+        IncrementTime();
+        
+        Graphics.DrawMeshInstancedIndirect(mesh, subMeshIndex, instanceMaterial, bounds, argsBuffer);
+    }
+
+    // Update the transform and animation metadata of the instanced objects
+    private void UpdateBuffers()
+    {
+        AssignTransforms assignmentJob = new AssignTransforms
+        {
+            _objectInfos       = objectInformationArray,
+            _numberOfInstances = numberOfInstances
+        };
+
+        JobHandle jobHandle = assignmentJob.Schedule(transformAccessArray);
+        jobHandle.Complete(); 
+
+        // Update the object information buffer
+        objectInformationBuffer?.Release();
+        objectInformationBuffer = new ComputeBuffer(objectInformationArray.Length, OBJECT_BUFFER_SIZE);
+        objectInformationBuffer.SetData(objectInformationArray);
+        instanceMaterial.SetBuffer("_ObjectInfoBuffer", objectInformationBuffer);
+    }
+
+    // Generates stacked position and normal textures from vertex animation textures
+    private void GenerateAndSetStackedTextures(AnimationObject[] animationObjects)
+    {
+        stackedPositionTexture = GenerateStackedTexture.GenerateStackedPositionTexture(animationObjects);
+        stackedNormalTexture   = GenerateStackedTexture.GenerateStackedNormalTexture(animationObjects);
+
+        // Store the textures in VRAM
+        instanceMaterial.SetTexture("_PosTex", stackedPositionTexture);
+        instanceMaterial.SetTexture("_NmlTex", stackedNormalTexture);
+    }
+
+    // Initializes object information and animation start times for a number of instances with randomized animation parameters.
+    private void InitializeObjectInformation()
+    {
+        objectInformationArray     = new NativeArray<objectInfo>(numberOfInstances, Allocator.Persistent);
+        currentAnimationStartTimes = new NativeArray<float>     (numberOfInstances, Allocator.Persistent);
+
+        for(int i = 0; i < objectInformationArray.Length; i++)
+        {
+            int randomIndex = UnityEngine.Random.Range(0, animationLengthsInSecs.Length);
+            objectInfo obj  = new objectInfo
+            {
+                isLooping        = 0,
+                currentAnimation = animationStartOffsets[randomIndex],
+                animationScale   = animationEndOffsets[randomIndex],
+                animationLength  = animationLengthsInSecs[randomIndex],
+                time             = 0.0f
+            };
+
+            currentAnimationStartTimes[i] = Time.timeSinceLevelLoad;
+            objectInformationArray[i]     = obj;
+        }
+    }
+
+    // Initialize data structures to store VAT (Vertex Animation Texture) animation metadata.
+    private void InitializeAnimationMetaData(AnimationObject[] animationObjects)
+    {
+        // Define the starting offset, end offset, and length of each animation.
+        animationStartOffsets  = new NativeArray<float>(animationObjects.Length, Allocator.Persistent);
+        animationEndOffsets    = new NativeArray<float>(animationObjects.Length, Allocator.Persistent);
+        animationLengthsInSecs = new NativeArray<float>(animationObjects.Length, Allocator.Persistent);
+
+        for(int currentIndex = 0; currentIndex < animationObjects.Length; currentIndex++)
+        {
+            // Calculate the end position of an animation in texture space within the stacked VATs
+            animationEndOffsets[currentIndex] = (float)(animationObjects[currentIndex].positionTexture.height-1) / (float)(stackedPositionTexture.height);
+            
+            for(int prevIndex = 0; prevIndex < currentIndex; prevIndex++)
+            {
+                // Set the animation start offset as the sum of previous starting offsets
+                if(prevIndex != currentIndex)
+                    animationStartOffsets[currentIndex] += (float)(animationObjects[prevIndex].positionTexture.height) / (float)(stackedPositionTexture.height); 
+            }
+
+            // Copy the animation lengths in seconds
+            animationLengthsInSecs[currentIndex] = animationObjects[currentIndex].animationLength;
+        }
+    }
+
+    // Release the allocated memory used by the animation renderer
+    public void ReleaseBuffers()
+    {
+        objectInformationArray.Dispose();
+        objectInformationBuffer?.Release();
+        objectInformationBuffer = null;
+        argsBuffer?.Release();
+        argsBuffer = null;
+        animationStartOffsets.Dispose();
+        animationLengthsInSecs.Dispose();
+        animationEndOffsets.Dispose();
+        currentAnimationStartTimes.Dispose();
+        transformAccessArray.Dispose();
+        renderedIndices.Dispose();
+        previousRenderedIndices.Dispose();
+    }
+
+    // Handle Non-Looping animations
+    private void HandleAnimations()
+    {
+        LoopHandlingJob loopHandlingJob = new LoopHandlingJob
+        {
+            _objectInfos                = objectInformationArray,
+            _currentAnimationStartTimes = currentAnimationStartTimes,
+            _animationStartOffsets      = animationStartOffsets,
+            _animationEndOffsets        = animationEndOffsets,
+            _animationLengthsInSecs     = animationLengthsInSecs,
+            currentTime                 = Time.timeSinceLevelLoad
+        };
+
+        JobHandle jobHandle = loopHandlingJob.Schedule(numberOfInstances, THREAD_GROUP_SIZE);
+        jobHandle.Complete();
+    }
+
+    // Increment each animated objects time value
+    private void IncrementTime()
+    {
+        TimeIncrementJob timeIncrementJob = new TimeIncrementJob
+        {
+            _objectInformationArray = objectInformationArray,
+            deltaTime               = Time.deltaTime
+        };
+
+        JobHandle jobHandle = timeIncrementJob.Schedule(numberOfInstances, THREAD_GROUP_SIZE);
+        jobHandle.Complete();
+    }
+
+    // Handle the rendering of the instanced level of detail and the base level of detail
+    public void RenderLODs(Transform[] objectTransforms, Vector3 playerPosition, float threshold)
+    {
+        try
+        {
+            previousRenderedIndices.Clear();
+            previousRenderedIndices.CopyFrom(renderedIndices);
+            renderedIndices.Clear();
+            LevelOfDetailJob levelOfDetailJob = new LevelOfDetailJob
+            {
+                _renderedIndices        = renderedIndices.AsParallelWriter(),
+                _objectInformationArray = objectInformationArray,
+                _playerPosition         = playerPosition,
+                _threshold              = threshold,
+                _numberOfInstances      = numberOfInstances
+            };
+
+            JobHandle jobHandle = levelOfDetailJob.Schedule(transformAccessArray);
+            jobHandle.Complete();
+
+            UpdateBuffers();
+
+            for(int i = 0; i < renderedIndices.Length; i++)
+            {
+                if(previousRenderedIndices.Contains(renderedIndices[i]))
+                    continue;
+                objectTransforms[renderedIndices[i]].gameObject.SetActive(true);
+            }
+
+            for(int i = 0; i < previousRenderedIndices.Length; i++)
+            {
+                if(renderedIndices.Contains(previousRenderedIndices[i]))
+                    continue;
+                objectTransforms[previousRenderedIndices[i]].gameObject.SetActive(false);
+        }
+        } catch(Exception e)
+        {
+            UnityEngine.Debug.LogException(e);
+            UnityEngine.Debug.Log("Lower the range threshold or increase the maximum capacity of the LOD buffer");
+        }
+    }
+}
